@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * MCP Gateway Server Example
  *
@@ -5,12 +6,10 @@
  * When downstream tools require x402 payment, the gateway wallet pays automatically.
  */
 import { config } from "dotenv";
-import { randomUUID } from "node:crypto";
-import express from "express";
 import { z } from "zod";
 import { privateKeyToAccount } from "viem/accounts";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ExactEvmScheme } from "@x402/evm/exact/client";
@@ -31,15 +30,11 @@ interface DownstreamServiceRecord {
   tools: Array<{ name: string; description?: string }>;
 }
 
-const evmPrivateKey = process.env.EVM_PRIVATE_KEY as `0x${string}` | undefined;
-if (!evmPrivateKey) {
-  console.error("❌ EVM_PRIVATE_KEY environment variable is required");
-  process.exit(1);
-}
+const evmPrivateKey = requireHexPrivateKey("EVM_PRIVATE_KEY");
 
 const rawDownstreamUrls = process.env.DOWNSTREAM_MCP_URLS ?? process.env.DOWNSTREAM_MCP_URL;
 if (!rawDownstreamUrls) {
-  console.error("❌ DOWNSTREAM_MCP_URL or DOWNSTREAM_MCP_URLS environment variable is required");
+  console.error("DOWNSTREAM_MCP_URL or DOWNSTREAM_MCP_URLS environment variable is required");
   process.exit(1);
 }
 
@@ -49,13 +44,30 @@ const downstreamUrls = rawDownstreamUrls
   .filter(Boolean);
 
 if (downstreamUrls.length === 0) {
-  console.error("❌ At least one downstream MCP URL is required");
+  console.error("At least one downstream MCP URL is required");
   process.exit(1);
 }
 
 const transportMode = parseTransportMode(process.env.DOWNSTREAM_MCP_TRANSPORT);
 const connectRetries = parseConnectRetries(process.env.DOWNSTREAM_CONNECT_RETRIES);
-const port = parseInt(process.env.PORT || "4023", 10);
+
+/**
+ * Reads required hex private key from environment.
+ *
+ * @param envName - Environment variable name.
+ * @returns Hex-prefixed private key.
+ */
+function requireHexPrivateKey(envName: string): `0x${string}` {
+  const value = process.env[envName];
+  if (!value) {
+    console.error(`${envName} environment variable is required`);
+    process.exit(1);
+  }
+  if (!value.startsWith("0x")) {
+    throw new Error(`${envName} must start with 0x.`);
+  }
+  return value as `0x${string}`;
+}
 
 /**
  * Parses configured transport mode.
@@ -148,21 +160,19 @@ async function connectWithTransportFallback(
           candidate === "sse"
             ? new SSEClientTransport(new globalThis.URL(url))
             : new StreamableHTTPClientTransport(new globalThis.URL(url), {
-              // Some providers strictly require both media types on streamable HTTP.
-              requestInit: {
-                headers: {
-                  Accept: "application/json, text/event-stream",
+                // Some providers strictly require both media types on streamable HTTP.
+                requestInit: {
+                  headers: {
+                    Accept: "application/json, text/event-stream",
+                  },
                 },
-              },
-            });
+              });
         await client.connect(transport);
         return candidate;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const cause =
-          error instanceof Error && error.cause instanceof Error
-            ? ` (cause: ${error.cause.message})`
-            : "";
+        // Avoid relying on Error.cause typing for older TS lib targets.
+        const cause = extractErrorCause(error);
         errors.push(`${candidate}#${attempt}: ${message}${cause}`);
         if (attempt < connectRetries) {
           await sleep(300 * attempt);
@@ -175,10 +185,30 @@ async function connectWithTransportFallback(
 }
 
 /**
+ * Extracts human-readable nested error cause string.
+ *
+ * @param error - Unknown error value.
+ * @returns Formatted cause suffix including leading space when present.
+ */
+function extractErrorCause(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return "";
+  }
+  const maybeCause = (error as { cause?: unknown }).cause;
+  if (maybeCause instanceof Error) {
+    return ` (cause: ${maybeCause.message})`;
+  }
+  if (typeof maybeCause === "string" && maybeCause.length > 0) {
+    return ` (cause: ${maybeCause})`;
+  }
+  return "";
+}
+
+/**
  * Creates and connects an x402 MCP client for one downstream endpoint.
  *
  * @param serviceId - Logical service identifier in the registry.
- * @param url - SSE URL of downstream MCP server.
+ * @param url - URL of downstream MCP server.
  * @param privateKey - Wallet private key used to pay downstream x402 challenges.
  * @param mode - Configured transport mode.
  * @returns Connected x402 MCP client instance and selected transport.
@@ -200,7 +230,7 @@ async function createAndConnectDownstreamClient(
     autoPayment: true,
     onPaymentRequested: async context => {
       const accepted = context.paymentRequired.accepts[0];
-      console.log(
+      console.error(
         `[payment] service=${serviceId} tool=${context.toolName} amount=${accepted.amount} network=${accepted.network}`,
       );
       return true;
@@ -214,7 +244,7 @@ async function createAndConnectDownstreamClient(
 /**
  * Builds the downstream service registry from configured URLs.
  *
- * @param urls - SSE URLs for downstream MCP servers.
+ * @param urls - URLs for downstream MCP servers.
  * @param privateKey - Wallet private key used by gateway for payment.
  * @param mode - Configured transport mode.
  * @returns Connected service records with discovered tool list.
@@ -242,9 +272,9 @@ async function initializeDownstreamRegistry(
     }));
     records.push({ serviceId, url, transport, client, tools });
 
-    console.log(`[registry] ${serviceId} connected -> ${url}`);
-    console.log(`[registry] ${serviceId} transport -> ${transport}`);
-    console.log(
+    console.error(`[registry] ${serviceId} connected -> ${url}`);
+    console.error(`[registry] ${serviceId} transport -> ${transport}`);
+    console.error(
       `[registry] ${serviceId} tools -> ${tools.map(tool => tool.name).join(", ") || "none"}`,
     );
   }
@@ -310,6 +340,7 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
     },
     async (args: { serviceId?: string; toolName: string; args?: JsonObject }) => {
       const service = selectService(registry, args.serviceId);
+
       const result = await service.client.callTool(args.toolName, args.args ?? {});
       const response = {
         serviceId: service.serviceId,
@@ -327,54 +358,34 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
 }
 
 /**
- * Starts gateway SSE transport and HTTP endpoints.
+ * Builds a configured gateway MCP server instance.
  *
- * @param mcpServer - Gateway MCP server instance.
- * @param gatewayPort - Port for gateway transport.
  * @param registry - Downstream service registry.
+ * @returns Gateway MCP server.
  */
-function startGatewayServer(
-  mcpServer: McpServer,
-  gatewayPort: number,
-  registry: DownstreamServiceRecord[],
-): void {
-  const app = express();
-  const transports = new Map<string, SSEServerTransport>();
-
-  app.get("/sse", async (_req, res) => {
-    const transport = new SSEServerTransport("/messages", res);
-    const sessionId = randomUUID();
-    transports.set(sessionId, transport);
-    res.on("close", () => {
-      transports.delete(sessionId);
-    });
-    await mcpServer.connect(transport);
+function buildGatewayMcpServer(registry: DownstreamServiceRecord[]): McpServer {
+  const mcpServer = new McpServer({
+    name: "x402 Gateway MCP",
+    version: "1.0.0",
   });
+  registerGatewayTools(mcpServer, registry);
+  return mcpServer;
+}
 
-  app.post("/messages", express.json(), async (req, res) => {
-    const transport = Array.from(transports.values())[0];
-    if (!transport) {
-      res.status(400).json({ error: "No active SSE connection" });
-      return;
-    }
-    await transport.handlePostMessage(req, res, req.body);
-  });
+/**
+ * Starts gateway on stdio transport.
+ *
+ * @param registry - Downstream service registry.
+ * @returns Promise resolved after stdio transport is attached.
+ */
+async function startGatewayServer(registry: DownstreamServiceRecord[]): Promise<void> {
+  const mcpServer = buildGatewayMcpServer(registry);
+  const transport = new StdioServerTransport();
+  await mcpServer.connect(transport);
 
-  app.get("/health", (_req, res) => {
-    res.json({
-      status: "ok",
-      mode: "gateway",
-      downstreamCount: registry.length,
-      tools: ["list_gateway_services", "call_service_tool"],
-    });
-  });
-
-  app.listen(gatewayPort, () => {
-    console.log(`🚀 Gateway MCP server running on http://localhost:${gatewayPort}`);
-    console.log(`🔗 Connect via SSE: http://localhost:${gatewayPort}/sse`);
-    console.log(`🧭 Downstream services: ${registry.map(item => item.serviceId).join(", ")}`);
-
-  });
+  // Use stderr logs to avoid interfering with stdio JSON-RPC payloads.
+  console.error("Gateway MCP server running on stdio transport");
+  console.error(`Downstream services: ${registry.map(item => item.serviceId).join(", ")}`);
 }
 
 /**
@@ -393,16 +404,10 @@ async function closeDownstreamClients(registry: DownstreamServiceRecord[]): Prom
  */
 export async function main(): Promise<void> {
   const registry = await initializeDownstreamRegistry(downstreamUrls, evmPrivateKey, transportMode);
-  const mcpServer = new McpServer({
-    name: "x402 Gateway MCP",
-    version: "1.0.0",
-  });
-
-  registerGatewayTools(mcpServer, registry);
-  startGatewayServer(mcpServer, port, registry);
+  await startGatewayServer(registry);
 
   process.on("SIGINT", async () => {
-    console.log("\nShutting down gateway...");
+    console.error("\nShutting down gateway...");
     await closeDownstreamClients(registry);
     process.exit(0);
   });
