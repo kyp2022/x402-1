@@ -120,6 +120,7 @@ PORT=4023
   - `auto`（默认，先 Streamable HTTP 再 SSE）
   - `streamable-http`
   - `sse`
+- `DOWNSTREAM_CONNECT_RETRIES`：连接下游的重试次数（默认 `3`，范围 `1-10`）
 - `PORT`：网关端口（默认 `4023`）
 
 ---

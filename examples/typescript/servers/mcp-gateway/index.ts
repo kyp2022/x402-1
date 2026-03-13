@@ -54,6 +54,7 @@ if (downstreamUrls.length === 0) {
 }
 
 const transportMode = parseTransportMode(process.env.DOWNSTREAM_MCP_TRANSPORT);
+const connectRetries = parseConnectRetries(process.env.DOWNSTREAM_CONNECT_RETRIES);
 const port = parseInt(process.env.PORT || "4023", 10);
 
 /**
@@ -74,6 +75,34 @@ function parseTransportMode(value?: string): DownstreamTransportMode {
   throw new Error(
     `Invalid DOWNSTREAM_MCP_TRANSPORT: ${value}. Expected one of auto|sse|streamable-http.`,
   );
+}
+
+/**
+ * Parses configured retry count for downstream connection.
+ *
+ * @param value - Optional environment value.
+ * @returns Retry count in the range [1, 10].
+ */
+function parseConnectRetries(value?: string): number {
+  if (!value) {
+    return 3;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 10) {
+    throw new Error(`Invalid DOWNSTREAM_CONNECT_RETRIES: ${value}. Expected integer in [1,10].`);
+  }
+  return parsed;
+}
+
+/**
+ * Sleeps for the provided milliseconds.
+ *
+ * @param ms - Milliseconds to wait.
+ * @returns Promise resolved after delay.
+ */
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms));
 }
 
 /**
@@ -113,11 +142,12 @@ async function connectWithTransportFallback(
   const errors: string[] = [];
 
   for (const candidate of candidates) {
-    try {
-      const transport =
-        candidate === "sse"
-          ? new SSEClientTransport(new globalThis.URL(url))
-          : new StreamableHTTPClientTransport(new globalThis.URL(url), {
+    for (let attempt = 1; attempt <= connectRetries; attempt += 1) {
+      try {
+        const transport =
+          candidate === "sse"
+            ? new SSEClientTransport(new globalThis.URL(url))
+            : new StreamableHTTPClientTransport(new globalThis.URL(url), {
               // Some providers strictly require both media types on streamable HTTP.
               requestInit: {
                 headers: {
@@ -125,11 +155,19 @@ async function connectWithTransportFallback(
                 },
               },
             });
-      await client.connect(transport);
-      return candidate;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      errors.push(`${candidate}: ${message}`);
+        await client.connect(transport);
+        return candidate;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const cause =
+          error instanceof Error && error.cause instanceof Error
+            ? ` (cause: ${error.cause.message})`
+            : "";
+        errors.push(`${candidate}#${attempt}: ${message}${cause}`);
+        if (attempt < connectRetries) {
+          await sleep(300 * attempt);
+        }
+      }
     }
   }
 
@@ -335,7 +373,7 @@ function startGatewayServer(
     console.log(`🚀 Gateway MCP server running on http://localhost:${gatewayPort}`);
     console.log(`🔗 Connect via SSE: http://localhost:${gatewayPort}/sse`);
     console.log(`🧭 Downstream services: ${registry.map(item => item.serviceId).join(", ")}`);
-    console.log("💳 Policy checks are intentionally disabled in this demo.");
+
   });
 }
 
