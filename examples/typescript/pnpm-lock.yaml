@@ -3361,67 +3361,6 @@ importers:
         specifier: ^5.9.2
         version: 5.9.2
 
-  servers/mcp-gateway:
-    dependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: ^1.12.1
-        version: 1.17.3
-      '@x402/evm':
-        specifier: workspace:*
-        version: link:../../../../typescript/packages/mechanisms/evm
-      '@x402/mcp':
-        specifier: workspace:*
-        version: link:../../../../typescript/packages/mcp
-      dotenv:
-        specifier: ^16.5.0
-        version: 16.6.1
-      express:
-        specifier: ^4.18.2
-        version: 4.21.2
-      viem:
-        specifier: ^2.39.0
-        version: 2.43.5(bufferutil@4.0.9)(typescript@5.9.2)(utf-8-validate@5.0.10)(zod@3.25.76)
-      zod:
-        specifier: ^3.24.3
-        version: 3.25.76
-    devDependencies:
-      '@eslint/js':
-        specifier: ^9.24.0
-        version: 9.33.0
-      '@types/express':
-        specifier: ^5.0.3
-        version: 5.0.3
-      '@types/node':
-        specifier: ^22.13.4
-        version: 22.17.2
-      '@typescript-eslint/eslint-plugin':
-        specifier: ^8.29.1
-        version: 8.48.0(@typescript-eslint/parser@8.48.0(eslint@9.33.0(jiti@2.6.1))(typescript@5.9.2))(eslint@9.33.0(jiti@2.6.1))(typescript@5.9.2)
-      '@typescript-eslint/parser':
-        specifier: ^8.29.1
-        version: 8.48.0(eslint@9.33.0(jiti@2.6.1))(typescript@5.9.2)
-      eslint:
-        specifier: ^9.24.0
-        version: 9.33.0(jiti@2.6.1)
-      eslint-plugin-import:
-        specifier: ^2.31.0
-        version: 2.32.0(@typescript-eslint/parser@8.48.0(eslint@9.33.0(jiti@2.6.1))(typescript@5.9.2))(eslint-import-resolver-typescript@3.10.1)(eslint@9.33.0(jiti@2.6.1))
-      eslint-plugin-jsdoc:
-        specifier: ^50.6.9
-        version: 50.8.0(eslint@9.33.0(jiti@2.6.1))
-      eslint-plugin-prettier:
-        specifier: ^5.2.6
-        version: 5.5.4(eslint-config-prettier@10.1.8(eslint@9.33.0(jiti@2.6.1)))(eslint@9.33.0(jiti@2.6.1))(prettier@3.5.2)
-      prettier:
-        specifier: 3.5.2
-        version: 3.5.2
-      tsx:
-        specifier: ^4.20.4
-        version: 4.20.4
-      typescript:
-        specifier: ^5.9.2
-        version: 5.9.2
-
   servers/offer-receipt:
     dependencies:
       '@x402/core':

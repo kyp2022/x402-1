@@ -1,14 +1,17 @@
 /**
- * MCP Client with x402 Payment Support - Advanced Example
+ * 带 x402 支付支持的 MCP 客户端 - 高级示例
  *
- * This example demonstrates the LOW-LEVEL API using `x402MCPClient` directly.
- * Use this approach when you need:
- * - Custom x402Client configuration
- * - Payment caching via onPaymentRequired hook
- * - Full control over the payment flow
- * - Integration with existing MCP clients
+ * 本示例演示底层 API：直接使用 x402MCPClient 进行手动配置。
+ * 适用于以下场景：
+ * - 自定义 x402Client 配置
+ * - 通过 onPaymentRequired 钩子实现支付缓存
+ * - 完全控制支付流程
+ * - 与现有 MCP 客户端集成
  *
- * Run with: pnpm dev:advanced
+ * 运行方式：pnpm dev:advanced
+ *
+ * @author kuangyp
+ * @version 2025-03-16
  */
 
 import { config } from "dotenv";
@@ -19,20 +22,23 @@ import { x402MCPClient } from "@x402/mcp";
 import { x402Client } from "@x402/core/client";
 import { privateKeyToAccount } from "viem/accounts";
 
+// 加载 .env 环境变量
 config();
 
+// 从环境变量获取 EVM 私钥
 const evmPrivateKey = process.env.EVM_PRIVATE_KEY as `0x${string}`;
 if (!evmPrivateKey) {
   console.error("❌ EVM_PRIVATE_KEY environment variable is required");
   process.exit(1);
 }
 
+// MCP 服务端地址
 const serverUrl = process.env.MCP_SERVER_URL || "http://localhost:4022";
 
 /**
- * Demonstrates the advanced API with manual setup and hooks.
+ * 演示高级 API：手动组装 MCP 客户端、支付客户端及各类钩子
  *
- * @returns Promise that resolves when demo is complete
+ * @returns 演示完成后 resolve 的 Promise
  */
 export async function main(): Promise<void> {
   console.log("\n📦 Using ADVANCED API (x402MCPClient with manual setup)\n");
@@ -42,10 +48,10 @@ export async function main(): Promise<void> {
   console.log("💳 Using wallet:", evmSigner.address);
 
   // ========================================================================
-  // ADVANCED: Manual setup with full control
+  // 高级模式：手动组装，获得完整控制权
   // ========================================================================
 
-  // Step 1: Create MCP client manually
+  // 步骤 1：手动创建 MCP 原生客户端
   const mcpClient = new Client(
     {
       name: "x402-mcp-client-advanced",
@@ -58,13 +64,14 @@ export async function main(): Promise<void> {
     },
   );
 
-  // Step 2: Create x402 payment client manually
+  // 步骤 2：手动创建 x402 支付客户端并注册链
   const paymentClient = new x402Client();
   paymentClient.register("eip155:84532", new ExactEvmScheme(evmSigner));
 
-  // Step 3: Compose into x402MCPClient
+  // 步骤 3：将 MCP 客户端与支付客户端组合为 x402MCPClient
   const x402Mcp = new x402MCPClient(mcpClient, paymentClient, {
     autoPayment: true,
+    // 支付前回调：返回 true 表示批准支付
     onPaymentRequested: async context => {
       const price = context.paymentRequired.accepts[0];
       console.log(`\n💰 Payment required for tool: ${context.toolName}`);
@@ -76,25 +83,25 @@ export async function main(): Promise<void> {
   });
 
   // ========================================================================
-  // ADVANCED: Register hooks for observability and control
+  // 高级模式：注册钩子用于可观测性与流程控制
   // ========================================================================
 
-  // Hook: Called when 402 is received (before payment)
-  // Can return custom payment or abort
+  // 钩子：收到 402 时调用（支付前）
+  // 可返回自定义 payment 或 abort 中止流程
   x402Mcp.onPaymentRequired(async context => {
     console.log(`🔔 [Hook] Payment required received for: ${context.toolName}`);
     console.log(`   Options: ${context.paymentRequired.accepts.length} payment option(s)`);
-    // Return void to proceed with normal payment flow
-    // Return { payment: ... } to use cached payment
-    // Return { abort: true } to abort
+    // 返回 void 继续正常支付流程
+    // 返回 { payment: ... } 使用缓存的支付
+    // 返回 { abort: true } 中止
   });
 
-  // Hook: Called before payment is created
+  // 钩子：创建支付前调用
   x402Mcp.onBeforePayment(async context => {
     console.log(`📝 [Hook] Creating payment for: ${context.toolName}`);
   });
 
-  // Hook: Called after payment is submitted
+  // 钩子：支付提交后调用
   x402Mcp.onAfterPayment(async context => {
     console.log(`✅ [Hook] Payment submitted for: ${context.toolName}`);
     if (context.settleResponse) {
@@ -102,13 +109,13 @@ export async function main(): Promise<void> {
     }
   });
 
-  // Connect and use
+  // 建立连接
   const transport = new SSEClientTransport(new URL(`${serverUrl}/sse`));
   await x402Mcp.connect(transport);
   console.log("✅ Connected to MCP server");
   console.log("📊 Hooks enabled: onPaymentRequired, onBeforePayment, onAfterPayment\n");
 
-  // List tools
+  // 列出可用工具
   console.log("📋 Discovering available tools...");
   const tools = await x402Mcp.listTools();
   console.log("Available tools:");
@@ -117,7 +124,7 @@ export async function main(): Promise<void> {
   }
   console.log();
 
-  // Test free tool
+  // 测试免费工具
   console.log("━".repeat(50));
   console.log("🆓 Test 1: Calling free tool (ping)");
   console.log("━".repeat(50));
@@ -127,7 +134,7 @@ export async function main(): Promise<void> {
   console.log("Payment made:", pingResult.paymentMade);
   console.log();
 
-  // Test paid tool
+  // 测试付费工具
   console.log("━".repeat(50));
   console.log("💰 Test 2: Calling paid tool (get_weather)");
   console.log("━".repeat(50));
@@ -144,7 +151,7 @@ export async function main(): Promise<void> {
     }
   }
 
-  // Test accessing underlying clients
+  // 测试访问底层客户端实例
   console.log("\n━".repeat(50));
   console.log("🔧 Test 3: Accessing underlying clients");
   console.log("━".repeat(50));

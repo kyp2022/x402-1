@@ -1,8 +1,9 @@
 /**
- * Facilitator with Discovery Extension Example
+ * Facilitator + Bazaar Discovery Extension 示例
  *
- * Demonstrates how to create a facilitator with bazaar discovery extension that
- * catalogs discovered x402 resources.
+ * 目标：
+ * 在常规 verify/settle 能力之外，演示 Facilitator 如何在验证阶段
+ * 抽取并记录支付中的 Discovery 扩展信息，形成可查询的资源目录（catalog）。
  */
 
 import { base58 } from "@scure/base";
@@ -27,14 +28,14 @@ import { baseSepolia } from "viem/chains";
 
 dotenv.config();
 
-// Configuration
+// 服务端口，默认 4022
 const PORT = process.env.PORT || "4022";
 
-// Configuration - optional per network
+// 按私钥动态启用网络（EVM/SVM 至少一条）
 const evmPrivateKey = process.env.EVM_PRIVATE_KEY as `0x${string}` | undefined;
 const svmPrivateKey = process.env.SVM_PRIVATE_KEY as string | undefined;
 
-// Validate at least one private key is provided
+// 至少提供一条链的私钥，否则无法对支付进行链上能力验证/结算
 if (!evmPrivateKey && !svmPrivateKey) {
   console.error(
     "❌ At least one of EVM_PRIVATE_KEY or SVM_PRIVATE_KEY is required",
@@ -42,11 +43,11 @@ if (!evmPrivateKey && !svmPrivateKey) {
   process.exit(1);
 }
 
-// Network configuration
+// CAIP-2 网络标识
 const EVM_NETWORK = "eip155:84532"; // Base Sepolia
 const SVM_NETWORK = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"; // Solana Devnet
 
-// DiscoveredResource represents a discovered x402 resource for the bazaar catalog
+// DiscoveredResource：目录中单条“已发现资源”的结构
 interface DiscoveredResource {
   resource: string;
   description?: string;
@@ -58,9 +59,10 @@ interface DiscoveredResource {
   lastUpdated: string;
 }
 
-// BazaarCatalog stores discovered resources
 /**
- * Catalog of discovered resources from bazaar discovery extension.
+ * BazaarCatalog：内存版目录存储（示例用途）
+ *
+ * 生产环境建议替换为持久化存储（如 Redis / PostgreSQL），并配合分页与过滤。
  */
 class BazaarCatalog {
   private resources: Map<string, DiscoveredResource> = new Map();
@@ -86,7 +88,7 @@ class BazaarCatalog {
 
 const bazaarCatalog = new BazaarCatalog();
 
-// Initialize the x402 Facilitator with discovery hooks
+// 在 onAfterVerify 中提取 discovery 信息并入库，是本示例的关键
 const facilitator = new x402Facilitator()
   .onBeforeVerify(async (context) => {
     console.log("Before verify", context);
@@ -94,7 +96,8 @@ const facilitator = new x402Facilitator()
   .onAfterVerify(async (context) => {
     console.log("✅ Payment verified");
 
-    // Extract discovered resource from payment for bazaar catalog
+    // 从 paymentPayload + requirements 中提取 bazaar discovery 信息
+    // validate = true 表示执行结构校验，避免脏数据进入目录
     try {
       const discovered = extractDiscoveryInfo(
         context.paymentPayload,
@@ -113,6 +116,7 @@ const facilitator = new x402Facilitator()
         }
         console.log(`   📝 X402Version: ${discovered.x402Version}`);
 
+        // 将此次支付关联的可发现资源写入目录
         bazaarCatalog.add({
           resource: discovered.resourceUrl,
           description: discovered.description,
@@ -126,6 +130,7 @@ const facilitator = new x402Facilitator()
         console.log("   ✅ Added to bazaar catalog");
       }
     } catch (err) {
+      // 扩展提取失败不应影响主支付流程，因此仅记录告警
       console.log(`   ⚠️  Failed to extract discovery info: ${err}`);
     }
   })
@@ -142,12 +147,12 @@ const facilitator = new x402Facilitator()
     console.log("Settle failure", context);
   });
 
-// Register EVM scheme if private key is provided
+// -------- EVM 注册分支 --------
 if (evmPrivateKey) {
   const evmAccount = privateKeyToAccount(evmPrivateKey);
   console.info(`EVM Facilitator account: ${evmAccount.address}`);
 
-  // Create a Viem client with both wallet and public capabilities
+  // viem 读写能力适配为 x402 的 EVM facilitator signer
   const viemClient = createWalletClient({
     account: evmAccount,
     chain: baseSepolia,
@@ -198,7 +203,7 @@ if (evmPrivateKey) {
   );
 }
 
-// Register SVM scheme if private key is provided
+// -------- SVM 注册分支 --------
 if (svmPrivateKey) {
   const svmAccount = await createKeyPairSignerFromBytes(
     base58.decode(svmPrivateKey),
@@ -210,15 +215,15 @@ if (svmPrivateKey) {
   facilitator.register(SVM_NETWORK, new ExactSvmScheme(svmSigner));
 }
 
-// Initialize Express app
+// 暴露 Facilitator HTTP 接口
 const app = express();
 app.use(express.json());
 
 /**
  * POST /verify
- * Verify a payment against requirements
+ * 校验支付：通过后会触发 onAfterVerify 并尝试抽取 discovery 信息
  *
- * Note: Payment tracking and bazaar discovery are handled by lifecycle hooks
+ * 注意：资源发现目录的入库逻辑不在接口函数里写死，而是在钩子中处理。
  */
 app.post("/verify", async (req, res) => {
   try {
@@ -233,9 +238,7 @@ app.post("/verify", async (req, res) => {
       });
     }
 
-    // Hooks will automatically:
-    // - Track verified payment (onAfterVerify)
-    // - Extract and catalog discovery info (onAfterVerify)
+    // 进入协议层 verify 流程
     const response: VerifyResponse = await facilitator.verify(
       paymentPayload,
       paymentRequirements,
@@ -252,7 +255,7 @@ app.post("/verify", async (req, res) => {
 
 /**
  * POST /settle
- * Settle a payment on-chain
+ * 执行链上结算（与基础示例一致）
  */
 app.post("/settle", async (req, res) => {
   try {
@@ -273,7 +276,7 @@ app.post("/settle", async (req, res) => {
   } catch (error) {
     console.error("Settle error:", error);
 
-    // Check if this was an abort from hook
+    // 对钩子主动中止结算进行协议化响应
     if (
       error instanceof Error &&
       error.message.includes("Settlement aborted:")
@@ -293,7 +296,7 @@ app.post("/settle", async (req, res) => {
 
 /**
  * GET /supported
- * Get supported payment kinds and extensions
+ * 返回 Facilitator 支持能力（网络、机制、扩展）
  */
 app.get("/supported", async (req, res) => {
   try {
@@ -309,7 +312,7 @@ app.get("/supported", async (req, res) => {
 
 /**
  * GET /discovery/resources
- * List all discovered resources from bazaar
+ * 返回当前目录中所有已发现资源（示例为内存数据）
  */
 app.get("/discovery/resources", async (req, res) => {
   try {
@@ -320,6 +323,7 @@ app.get("/discovery/resources", async (req, res) => {
       pagination: {
         limit: 100,
         offset: 0,
+        // total 便于前端做分页器与结果概览
         total: resources.length,
       },
     });
@@ -333,13 +337,13 @@ app.get("/discovery/resources", async (req, res) => {
 
 /**
  * GET /health
- * Health check endpoint
+ * 健康检查接口
  */
 app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
-// Start the server
+// 启动后会打印 discovery 查询入口
 app.listen(parseInt(PORT), () => {
   console.log(`🚀 Discovery Facilitator listening on http://localhost:${PORT}`);
   console.log(
