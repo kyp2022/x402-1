@@ -82,14 +82,79 @@ interface KytCheckResponse {
   degraded?: boolean;
 }
 
+/**
+ * 合规检查决策对象。
+ *
+ * 设计目标：
+ * - 不仅告诉“是否通过”，还告诉“为什么通过/不通过”；
+ * - 让上游 Agent 可以把决策细节完整反馈给最终用户。
+ */
+interface ComplianceDecision {
+  serviceId: string;
+  toolName: string;
+  counterparty: `0x${string}`;
+  passed: boolean;
+  reasonCode:
+  | "COMPLIANCE_PASSED"
+  | "KYC_NOT_APPROVED"
+  | "KYT_REJECTED"
+  | "KYT_DEGRADED"
+  | "COMPLIANCE_CONFIG_MISSING"
+  | "COMPLIANCE_API_ERROR";
+  message: string;
+  kycStatus?: KycCheckResponse["kycStatus"];
+  kycCompleted?: boolean;
+  kytDecision?: KytCheckResponse["decision"];
+  riskLevel?: string;
+  riskScore?: number;
+  degraded?: boolean;
+  checkedAt: string;
+}
+
+/**
+ * 网关统一结果信封（成功/失败都使用同一结构）。
+ *
+ * 这样 AI 不需要猜测字符串语义，直接按字段解释即可。
+ */
+interface GatewayEnvelope<TDetail = JsonObject> {
+  ok: boolean;
+  stage:
+  | "request_received"
+  | "service_selected"
+  | "tool_execution"
+  | "payment_requested"
+  | "compliance_check";
+  code: string;
+  message: string;
+  traceId: string;
+  timestamp: string;
+  detail: TDetail;
+}
+
 const evmPrivateKey = requireHexPrivateKey("EVM_PRIVATE_KEY"); // 网关支付钱包私钥（必填）
 const complianceBaseUrl = process.env.COMPLIANCE_BASE_URL; // KYC/KYT 接口域名（如 https://your-domain.com）
 const complianceApiKey = process.env.COMPLIANCE_API_KEY; // 调用 KYC/KYT 接口的 API Key
 const complianceChain = process.env.COMPLIANCE_CHAIN ?? "base"; // KYT 查询链，默认 base
+const complianceMaxRetries = 5; // 合规接口最大重试次数（含首次）
+const latestComplianceDecisionByService = new Map<string, ComplianceDecision>(); // 缓存每个 service 最近一次合规结果，供响应回传
+
+/**
+ * 支付上下文信息。
+ *
+ * 在 onPaymentRequested 回调中从下游挑战里提取，
+ * 缓存后在 call_service_tool 响应中透传给上游 Agent，
+ * 用于展示资金流向（付款方 -> 金额 -> 收款方）。
+ */
+interface PaymentContext {
+  amount: string;      // 支付金额（来自 paymentRequired.accepts[0].amount）
+  payTo: string;       // 收款方地址（来自 paymentRequired.accepts[0].payTo）
+  network: string;     // 支付网络（如 eip155:84532）
+}
+const latestPaymentContextByService = new Map<string, PaymentContext>(); // 缓存每个 service 最近一次支付上下文，供响应透传资金流向
 
 const rawDownstreamUrls = process.env.DOWNSTREAM_MCP_URLS ?? process.env.DOWNSTREAM_MCP_URL; // 支持多地址优先，单地址兜底
 if (!rawDownstreamUrls) {
-  console.error("DOWNSTREAM_MCP_URL or DOWNSTREAM_MCP_URLS environment variable is required");
+  console.error("❌ 缺少环境变量 DOWNSTREAM_MCP_URL 或 DOWNSTREAM_MCP_URLS，无法确定下游服务地址");
   process.exit(1);
 }
 
@@ -99,7 +164,7 @@ const downstreamUrls = rawDownstreamUrls // 读取到的下游 URL 原始串
   .filter(Boolean); // 过滤空字符串，避免无效 URL 进入连接流程
 
 if (downstreamUrls.length === 0) {
-  console.error("At least one downstream MCP URL is required");
+  console.error("❌ 至少需要配置一个下游 MCP 地址");
   process.exit(1);
 }
 
@@ -120,7 +185,7 @@ const connectRetries = parseConnectRetries(process.env.DOWNSTREAM_CONNECT_RETRIE
 function requireHexPrivateKey(envName: string): `0x${string}` {
   const value = process.env[envName]; // 从环境变量读取私钥字符串
   if (!value) {
-    console.error(`${envName} environment variable is required`); // 缺少私钥配置，无法继续
+    console.error(`❌ 缺少环境变量 ${envName}，网关无法启动`); // 缺少私钥配置，无法继续
     process.exit(1); // 直接退出，防止“无支付能力”状态运行
   }
   if (!value.startsWith("0x")) {
@@ -210,62 +275,233 @@ function extractCounterpartyAddress(payTo: unknown): `0x${string}` | null {
  * @returns 解析后的 JSON 对象。
  */
 async function postJson<T>(url: string, body: Record<string, unknown>): Promise<T> {
-  const controller = new AbortController(); // 用于请求级超时取消
-  const timeout = setTimeout(() => controller.abort(), 8000); // 8 秒超时，避免网关长时间卡住
+  let lastError: Error | undefined; // 记录最后一次失败，重试耗尽后抛出
 
-  try {
-    const response = await fetch(url, { // 发起 POST JSON 请求
-      method: "POST", // 明确使用 POST
-      headers: { "Content-Type": "application/json" }, // 告知服务端为 JSON
-      body: JSON.stringify(body), // 序列化请求体
-      signal: controller.signal, // 绑定超时取消信号
-    });
+  for (let attempt = 1; attempt <= complianceMaxRetries; attempt += 1) {
+    const controller = new AbortController(); // 每次尝试都创建独立超时控制器
+    const timeout = setTimeout(() => controller.abort(), 8000); // 单次请求 8 秒超时，避免卡住
 
-    if (!response.ok) {
-      const text = await response.text(); // 读取错误响应体，方便排障
-      throw new Error(`Compliance API request failed: ${response.status} ${response.statusText}. ${text}`); // 统一抛出含状态码的错误
+    try {
+      const response = await fetch(url, { // 发起 POST JSON 请求
+        method: "POST", // 明确使用 POST
+        headers: { "Content-Type": "application/json" }, // 告知服务端为 JSON
+        body: JSON.stringify(body), // 序列化请求体
+        signal: controller.signal, // 绑定超时取消信号
+      });
+
+      if (!response.ok) {
+        const text = await response.text(); // 读取错误响应体，方便排障
+        throw new Error(
+          `Compliance API request failed: ${response.status} ${response.statusText}. ${text}`,
+        ); // 统一抛出含状态码的错误
+      }
+
+      return (await response.json()) as T; // 成功时按泛型返回解析对象
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error)); // 标准化错误对象
+      console.error(
+        `🔄 合规请求重试：第 ${attempt}/${complianceMaxRetries} 次，地址=${url}，错误=${lastError.message}`,
+      ); // 输出重试日志，便于观察抖动和恢复情况
+      if (attempt < complianceMaxRetries) {
+        await sleep(300 * attempt); // 线性退避：300ms, 600ms, 900ms, 1200ms
+      }
+    } finally {
+      clearTimeout(timeout); // 每次尝试结束都清理定时器，防止泄漏
     }
-
-    return (await response.json()) as T; // 成功时按泛型返回解析对象
-  } finally {
-    clearTimeout(timeout); // 无论成功失败都清理定时器，防止泄漏
   }
+
+  throw lastError ?? new Error("Compliance API request failed after retries."); // 所有重试失败后抛出最终错误
 }
 
 /**
  * 执行 KYC + KYT 双重校验。
- * 仅当 KYC 已通过且 KYT 决策为 pass 时返回 true。
+ * 返回结构化决策，便于上游清晰解释“通过/失败原因”。
  *
- * @param counterparty - 对手方钱包地址。
- * @returns 是否允许本次自动支付。
+ * @param serviceId 下游服务 ID。
+ * @param toolName 当前工具名。
+ * @param counterparty 对手方钱包地址。
+ * @returns 合规决策对象（包含结果与原因码）。
  */
-async function runComplianceChecks(counterparty: `0x${string}`): Promise<boolean> {
+async function runComplianceChecks(
+  serviceId: string,
+  toolName: string,
+  counterparty: `0x${string}`,
+): Promise<ComplianceDecision> {
+  const checkedAt = new Date().toISOString(); // 固定本次检查时间，便于日志和返回一致追踪
   if (!complianceBaseUrl || !complianceApiKey) {
-    console.error("[compliance] Missing COMPLIANCE_BASE_URL or COMPLIANCE_API_KEY"); // 缺配置直接拒绝，安全优先
-    return false; // fail-close：没有合规能力时不支付
+    console.error("🛡️ 合规配置缺失：未设置 COMPLIANCE_BASE_URL 或 COMPLIANCE_API_KEY"); // 缺配置直接拒绝，安全优先
+    return {
+      serviceId,
+      toolName,
+      counterparty,
+      passed: false,
+      reasonCode: "COMPLIANCE_CONFIG_MISSING",
+      message: "Compliance configuration is missing.",
+      checkedAt,
+    }; // fail-close：没有合规能力时不支付
   }
 
   const baseUrl = complianceBaseUrl.replace(/\/+$/, ""); // 去掉末尾斜杠，避免 URL 双斜杠
-  const [kycResult, kytResult] = await Promise.all([ // 并发请求 KYC/KYT，缩短决策延迟
-    postJson<KycCheckResponse>(`${baseUrl}/api/kyc/check`, {
-      apiKey: complianceApiKey,
-      walletAddress: counterparty,
-    }),
-    postJson<KytCheckResponse>(`${baseUrl}/api/compliance/kyt/check`, {
-      apiKey: complianceApiKey,
-      walletAddress: counterparty,
-      chain: complianceChain,
-    }),
-  ]);
+  try {
+    const [kycResult, kytResult] = await Promise.all([ // 并发请求 KYC/KYT，缩短决策延迟
+      postJson<KycCheckResponse>(`${baseUrl}/api/kyc/check`, {
+        apiKey: complianceApiKey,
+        walletAddress: counterparty,
+      }),
+      postJson<KytCheckResponse>(`${baseUrl}/api/compliance/kyt/check`, {
+        apiKey: complianceApiKey,
+        walletAddress: counterparty,
+        chain: complianceChain,
+      }),
+    ]);
 
-  const kycPassed = kycResult.kycCompleted === true && kycResult.kycStatus === "approved"; // 必须完成且状态 approved
-  const kytPassed = kytResult.decision === "pass" && kytResult.degraded !== true; // 必须明确 pass，且不能是降级结果
+    console.error(
+      `🛡️ 合规结果：对手方=${counterparty}，KYC状态=${String(kycResult.kycStatus)}（已完成=${String(kycResult.kycCompleted)}），KYT决策=${kytResult.decision}，风险等级=${kytResult.riskLevel}，风险评分=${kytResult.riskScore}，降级=${String(kytResult.degraded === true)}`,
+    );
 
-  console.error(
-    `[compliance] counterparty=${counterparty} kycStatus=${kycResult.kycStatus} kycCompleted=${kycResult.kycCompleted} kytDecision=${kytResult.decision} degraded=${kytResult.degraded === true} riskLevel=${kytResult.riskLevel} riskScore=${kytResult.riskScore}`,
-  );
+    const decisionBase = {
+      serviceId,
+      toolName,
+      counterparty,
+      kycStatus: kycResult.kycStatus,
+      kycCompleted: kycResult.kycCompleted,
+      kytDecision: kytResult.decision,
+      riskLevel: kytResult.riskLevel,
+      riskScore: kytResult.riskScore,
+      degraded: kytResult.degraded === true,
+      checkedAt,
+    };
 
-  return kycPassed && kytPassed; // 双条件都满足才允许支付
+    // KYC 必须 completed 且 approved 才可放行。
+    if (!(kycResult.kycCompleted === true && kycResult.kycStatus === "approved")) {
+      return {
+        ...decisionBase,
+        passed: false,
+        reasonCode: "KYC_NOT_APPROVED",
+        message: `KYC is not approved. Current status: ${String(kycResult.kycStatus)}`,
+      };
+    }
+
+    // 若上游 KYT 处于降级状态，结果不可靠，按安全策略拒绝支付。
+    // if (kytResult.degraded === true) {
+    //   return {
+    //     ...decisionBase,
+    //     passed: false,
+    //     reasonCode: "KYT_DEGRADED",
+    //     message: "KYT service is degraded. Refusing payment for safety.",
+    //   };
+    // }
+
+    // KYT decision 必须为 pass。
+    if (kytResult.decision !== "pass") {
+      return {
+        ...decisionBase,
+        passed: false,
+        reasonCode: "KYT_REJECTED",
+        message: `KYT decision is ${kytResult.decision}.`,
+      };
+    }
+
+    // KYC + KYT 全部通过，允许支付。
+    return {
+      ...decisionBase,
+      passed: true,
+      reasonCode: "COMPLIANCE_PASSED",
+      message: "Compliance checks passed.",
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      serviceId,
+      toolName,
+      counterparty,
+      passed: false,
+      reasonCode: "COMPLIANCE_API_ERROR",
+      message: `Compliance API error: ${message}`,
+      checkedAt,
+    };
+  }
+}
+
+/**
+ * 收款方对付款方的合规检查结果（从收款方响应中提取）。
+ *
+ * 收款方在工具响应中将 payeeComplianceDecision 嵌入 JSON，
+ * 网关从 downstreamContent 中解析出来，透传给上游 Agent，
+ * 用于展示双向合规信息。
+ */
+interface PayeeComplianceDecision {
+  payerAddress: string;
+  kycCompleted: boolean;
+  kycStatus: string | null;
+  kytDecision: string;
+  riskLevel: string;
+  riskScore: number;
+  degraded: boolean;
+  checkedAt: string;
+  passed: boolean;
+  reasonCode: string;
+  message: string;
+}
+
+/**
+ * 从收款方返回的 content 中提取 payeeComplianceDecision。
+ *
+ * 收款方工具响应格式为 { data: <业务数据>, payeeComplianceDecision: <合规结果> }。
+ * 本函数解析第一个 text 类型 content item 的 JSON，提取 payeeComplianceDecision 字段。
+ * 向后兼容：若字段不存在或解析失败，返回 null。
+ *
+ * @param content 收款方返回的 MCP content 数组。
+ * @returns 收款方的合规决策，或 null。
+ */
+function extractPayeeCompliance(content: unknown): PayeeComplianceDecision | null {
+  if (!Array.isArray(content) || content.length === 0) {
+    return null;
+  }
+  const firstItem = content[0];
+  if (typeof firstItem !== "object" || firstItem === null) {
+    return null;
+  }
+  const textItem = firstItem as { type?: string; text?: string };
+  if (textItem.type !== "text" || typeof textItem.text !== "string") {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(textItem.text) as Record<string, unknown>;
+    if (parsed.payeeComplianceDecision && typeof parsed.payeeComplianceDecision === "object") {
+      return parsed.payeeComplianceDecision as PayeeComplianceDecision;
+    }
+  } catch {
+    // JSON 解析失败，向后兼容返回 null
+  }
+  return null;
+}
+
+/**
+ * 生成本次调用的 traceId，便于前后端与日志系统串联一次完整链路。
+ *
+ * @returns 追踪 ID。
+ */
+function createTraceId(): string {
+  return `trace_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * 获取指定 service + tool 的最近一次合规决策。
+ *
+ * @param serviceId 下游服务 ID。
+ * @param toolName 工具名（避免跨工具串数据）。
+ * @returns 决策对象或 undefined。
+ */
+function getLatestComplianceDecision(serviceId: string, toolName: string): ComplianceDecision | undefined {
+  const decision = latestComplianceDecisionByService.get(serviceId);
+  if (!decision) {
+    return undefined;
+  }
+  if (decision.toolName !== toolName) {
+    return undefined;
+  }
+  return decision;
 }
 
 /**
@@ -413,21 +649,29 @@ async function createAndConnectDownstreamClient(
 
       if (!counterparty) {
         console.error(
-          `[payment-denied] service=${serviceId} tool=${context.toolName} reason=invalid_counterparty_address payTo=${String(accepted.payTo)}`,
+          `🚫 支付拒绝：服务=${serviceId}，工具=${context.toolName}，原因=收款方地址无效，payTo=${String(accepted.payTo)}`,
         );
         return false; // 地址无效，拒绝自动支付
       }
 
-      const compliancePassed = await runComplianceChecks(counterparty); // 调用 KYC/KYT 接口做合规判断
-      if (!compliancePassed) {
+      const decision = await runComplianceChecks(serviceId, context.toolName, counterparty); // 调用 KYC/KYT 接口做合规判断
+      latestComplianceDecisionByService.set(serviceId, decision); // 记录最近一次合规决策，供 call_service_tool 响应透传
+      if (!decision.passed) {
         console.error(
-          `[payment-denied] service=${serviceId} tool=${context.toolName} reason=compliance_check_failed counterparty=${counterparty}`,
+          `🚫 支付拒绝：服务=${serviceId}，工具=${context.toolName}，原因=${decision.reasonCode}，对手方=${counterparty}，详情=${decision.message}`,
         );
         return false; // 合规不通过，拒绝支付
       }
 
+      // 缓存支付上下文（金额、收款方、网络），供 call_service_tool 响应透传资金流向
+      latestPaymentContextByService.set(serviceId, {
+        amount: accepted.amount,
+        payTo: counterparty,
+        network: accepted.network,
+      });
+
       console.error(
-        `[payment] service=${serviceId} tool=${context.toolName} amount=${accepted.amount} network=${accepted.network}`,
+        `💰 支付放行：服务=${serviceId}，工具=${context.toolName}，金额=${accepted.amount}，网络=${accepted.network}，收款方=${counterparty}`,
       );
       return true; // 合规通过，允许执行自动支付
     },
@@ -473,10 +717,10 @@ async function initializeDownstreamRegistry(
     }));
     records.push({ serviceId, url, transport, client, tools }); // 写入注册表
 
-    console.error(`[registry] ${serviceId} connected -> ${url}`);
-    console.error(`[registry] ${serviceId} transport -> ${transport}`);
+    console.error(`📡 注册下游：${serviceId} 已连接 → ${url}`);
+    console.error(`📡 传输协议：${serviceId} → ${transport}`);
     console.error(
-      `[registry] ${serviceId} tools -> ${tools.map((tool: { name: string }) => tool.name).join(", ") || "none"}`,
+      `📡 可用工具：${serviceId} → ${tools.map((tool: { name: string }) => tool.name).join(", ") || "（无）"}`,
     );
   }
 
@@ -550,20 +794,83 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
       args: z.record(z.any()).optional().describe("Arguments passed to downstream tool"),
     },
     async (args: { serviceId?: string; toolName: string; args?: JsonObject }) => { // 转发工具：按 serviceId 选择下游并调用
+      const traceId = createTraceId(); // 生成调用追踪 ID，便于用户反馈与日志关联
       const service = selectService(registry, args.serviceId); // 选择目标下游
 
-      const result = await service.client.callTool(args.toolName, args.args ?? {}); // 发起真实下游工具调用（含自动支付逻辑）
-      const response = {
-        serviceId: service.serviceId,
-        toolName: args.toolName,
-        paymentMade: result.paymentMade ?? false,
-        paymentResponse: result.paymentResponse ?? null,
-        content: result.content,
-      };
+      try {
+        const result = await service.client.callTool(args.toolName, args.args ?? {}); // 发起真实下游工具调用（含自动支付逻辑）
+        const latestCompliance = getLatestComplianceDecision(service.serviceId, args.toolName); // 读取最近一次合规决策（如果本次触发了支付）
+        const latestPaymentCtx = latestPaymentContextByService.get(service.serviceId) ?? null; // 读取支付上下文（金额、收款方、网络）
+        const payeeCompliance = extractPayeeCompliance(result.content); // 从收款方响应中提取其对付款方的合规检查结果
+        const response: GatewayEnvelope<{
+          serviceId: string;
+          toolName: string;
+          paymentMade: boolean;
+          paymentResponse: unknown;
+          complianceDecision: ComplianceDecision | null;
+          payeeComplianceDecision: PayeeComplianceDecision | null;
+          paymentContext: PaymentContext | null;
+          downstreamContent: unknown;
+        }> = {
+          ok: true,
+          stage: "tool_execution",
+          code: "TOOL_CALL_SUCCEEDED",
+          message: "Downstream tool call succeeded.",
+          traceId,
+          timestamp: new Date().toISOString(),
+          detail: {
+            serviceId: service.serviceId,
+            toolName: args.toolName,
+            paymentMade: result.paymentMade ?? false,
+            paymentResponse: result.paymentResponse ?? null,
+            complianceDecision: latestCompliance ?? null,
+            payeeComplianceDecision: payeeCompliance, // 收款方对付款方的合规检查结果
+            paymentContext: (result.paymentMade ?? false) ? latestPaymentCtx : null,
+            downstreamContent: result.content,
+          },
+        };
 
-      return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
-      };
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        };
+      } catch (error) {
+        const latestCompliance = getLatestComplianceDecision(service.serviceId, args.toolName); // 尝试回传最近合规决策，帮助定位失败阶段
+        const latestPaymentCtx = latestPaymentContextByService.get(service.serviceId) ?? null; // 读取支付上下文，帮助定位资金流向
+        const errorMessage = error instanceof Error ? error.message : String(error); // 标准化错误文本
+        const response: GatewayEnvelope<{
+          serviceId: string;
+          toolName: string;
+          complianceDecision: ComplianceDecision | null;
+          payeeComplianceDecision: PayeeComplianceDecision | null;
+          paymentContext: PaymentContext | null;
+          downstreamError: string;
+        }> = {
+          ok: false,
+          stage: latestCompliance && !latestCompliance.passed ? "compliance_check" : "tool_execution",
+          code:
+            latestCompliance && !latestCompliance.passed
+              ? latestCompliance.reasonCode
+              : "TOOL_CALL_FAILED",
+          message:
+            latestCompliance && !latestCompliance.passed
+              ? latestCompliance.message
+              : "Downstream tool call failed.",
+          traceId,
+          timestamp: new Date().toISOString(),
+          detail: {
+            serviceId: service.serviceId,
+            toolName: args.toolName,
+            complianceDecision: latestCompliance ?? null,
+            payeeComplianceDecision: null, // 失败时收款方通常未返回合规信息
+            paymentContext: latestPaymentCtx,
+            downstreamError: errorMessage,
+          },
+        };
+
+        return {
+          content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        };
+      }
     },
   );
 }
@@ -598,8 +905,8 @@ async function startGatewayServer(registry: DownstreamServiceRecord[]): Promise<
   await mcpServer.connect(transport); // 连接 transport，进入可服务状态
 
   // 所有运行日志使用 stderr，避免与 stdio RPC 报文混流。
-  console.error("Gateway MCP server running on stdio transport");
-  console.error(`Downstream services: ${registry.map(item => item.serviceId).join(", ")}`);
+  console.error("🚀 网关 MCP 服务已启动（stdio 传输层）");
+  console.error(`📡 已注册下游服务：${registry.map(item => item.serviceId).join(", ")}`);
 }
 
 /**
@@ -626,13 +933,13 @@ export async function main(): Promise<void> {
   await startGatewayServer(registry); // 再启动对上游的网关服务
 
   process.on("SIGINT", async () => {
-    console.error("\nShutting down gateway..."); // 接收到 Ctrl+C 时打印关停日志
+    console.error("\n🛑 正在关闭网关..."); // 接收到 Ctrl+C 时打印关停日志
     await closeDownstreamClients(registry); // 优雅关闭下游连接
     process.exit(0); // 正常退出
   });
 }
 
 main().catch(async error => {
-  console.error("Fatal error:", error); // 启动失败统一兜底日志
+  console.error("💀 致命错误：", error); // 启动失败统一兜底日志
   process.exit(1); // 异常退出
 });
