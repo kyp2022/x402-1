@@ -75,14 +75,14 @@ DOWNSTREAM_CONNECT_RETRIES=3
 
 ## 启动方式
 
-1) 安装依赖（examples 根目录）：
+1. 安装依赖（examples 根目录）：
 
 ```bash
 cd /Users/ppg/Desktop/agentry/x402/examples/typescript
 pnpm install --no-frozen-lockfile
 ```
 
-2) 本地命令启动网关（stdio）：
+2. 本地命令启动网关（stdio）：
 
 ```bash
 cd /Users/ppg/Desktop/agentry/x402/examples/typescript/servers/mcp-gateway
@@ -124,7 +124,7 @@ pnpm dev
 
 如果你希望别人不依赖你的本地仓库路径，推荐发布为 npm CLI 包。
 
-1) 在本目录执行打包自检：
+1. 在本目录执行打包自检：
 
 ```bash
 cd /Users/ppg/Desktop/agentry/x402/examples/typescript/servers/mcp-gateway
@@ -134,7 +134,7 @@ pnpm exec tsc --noEmit
 pnpm pack
 ```
 
-2) 验证无误后发布：
+2. 验证无误后发布：
 
 ```bash
 npm publish
