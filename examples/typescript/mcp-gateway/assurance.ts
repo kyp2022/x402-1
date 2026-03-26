@@ -224,6 +224,11 @@ export interface AssuranceResult {
   passed: boolean;
   errorCode?: AssuranceErrorCode;
   errorMessage?: string;
+  /**
+   * 买方 Intent Mandate ID（仅 passed=true 时存在）。
+   * 来自 API 11.5 响应的 data.mandate.id，用于写入交易记录。
+   */
+  mandateId?: string;
   /** 检查执行时间（ISO 8601） */
   checkedAt: string;
 }
@@ -611,10 +616,10 @@ export async function runAssuranceCheck(
 
     // 三重校验全部通过
     console.error(
-      `✅ AP2 验证通过：商户=${cartMandate.merchant_address}，金额=${cartMandate.total_amount} ${cartMandate.currency ?? ""}，买方=${payerWalletAddress}，剩余预算=${remainingBudget}`,
+      `✅ AP2 验证通过：商户=${cartMandate.merchant_address}，金额=${cartMandate.total_amount} ${cartMandate.currency ?? ""}，买方=${payerWalletAddress}，剩余预算=${remainingBudget}，mandateId=${mandate.id}`,
     );
 
-    return { passed: true, checkedAt };
+    return { passed: true, mandateId: mandate.id, checkedAt };
   } catch (error) {
     // fail-close：接口调用异常时默认拒绝，防止风控被绕过
     const message = error instanceof Error ? error.message : String(error);

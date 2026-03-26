@@ -565,6 +565,7 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
 
         // 异步写入交易记录（fire-and-forget），仅在实际发生支付时记录
         if (result.paymentMade && transactionConfig) {
+          const latestAssuranceForTx = latestAssuranceResultByService.get(service.serviceId) ?? null;
           recordTransaction(transactionConfig, buildTransactionPayload(transactionConfig, {
             toolName: args.toolName,
             serviceResult: "pass",
@@ -572,6 +573,8 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
             paymentResponseData,
             payerCompliance: latestCompliance ?? null,
             payeeCompliance,
+            // AP2 通过时携带 mandateId，非 AP2 场景传空字符串
+            intentMandateId: latestAssuranceForTx?.mandateId ?? "",
           }));
         }
 
@@ -623,6 +626,8 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
             paymentResponseData: null,
             payerCompliance: latestCompliance ?? null,
             payeeCompliance: null,
+            // 失败路径：支付未发生，mandateId 无意义，传空字符串
+            intentMandateId: "",
           }));
         }
 

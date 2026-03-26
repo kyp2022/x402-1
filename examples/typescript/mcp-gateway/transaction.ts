@@ -66,7 +66,13 @@ export interface TransactionRecordPayload {
   serviceResult: "pass" | "reject" | "error";
   chain: string;
   txHash?: string;
-  amount?: string;
+  /** 转账金额（人类可读格式，如 "0.10"），API 要求必填，无支付时传 "0" */
+  amount: string;
+  /**
+   * AP2 Intent Mandate ID（来自 /api/mandates/intent/vc 的 data.mandate.id）。
+   * AP2 校验通过时必填；非 AP2 场景或支付被拒绝时传空字符串。
+   */
+  intentMandateId: string;
   tokenSymbol?: string;
   payer?: string;
   payee?: string;
@@ -160,16 +166,20 @@ export function buildTransactionPayload(
     paymentResponseData: PaymentResponseData | null;
     payerCompliance: ComplianceDecision | null;
     payeeCompliance: PayeeComplianceDecision | null;
+    /** AP2 Intent Mandate ID，校验通过时由 AssuranceResult.mandateId 提供 */
+    intentMandateId: string;
   },
 ): TransactionRecordPayload {
-  const { toolName, serviceResult, paymentCtx, paymentResponseData, payerCompliance, payeeCompliance } = params;
+  const { toolName, serviceResult, paymentCtx, paymentResponseData, payerCompliance, payeeCompliance, intentMandateId } = params;
 
   return {
     serviceName: toolName,
     serviceResult,
     chain: paymentCtx?.network ?? paymentResponseData?.network ?? config.defaultChain,
     txHash: paymentResponseData?.transaction,
-    amount: formatUsdcAmount(paymentCtx?.amount),
+    // amount 为 API 必填字段：有支付则转换原始精度，无支付兜底传 "0"
+    amount: formatUsdcAmount(paymentCtx?.amount) ?? "0",
+    intentMandateId,
     tokenSymbol: paymentCtx?.tokenSymbol,
     payer: paymentResponseData?.payer,
     payee: paymentCtx?.payTo,
