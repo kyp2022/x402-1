@@ -6,12 +6,19 @@
  * 1) 对上游 Agent（如 Cursor）暴露一个统一的 MCP 服务入口（stdio）。
  * 2) 将工具调用转发给一个或多个下游 MCP 服务。
  * 3) 当下游返回 x402 支付挑战时，网关使用本地钱包自动支付。
- * 4) 在自动支付前，执行 KYC/KYT 合规检查，不满足则拒绝支付。
+ * 4) 在自动支付前，依次执行（fail-close，任一失败即拒绝）：
+ *    a. AP2 意图凭证验证（Intent Mandate：单笔限额 + 剩余预算）。
+ *    b. AP2 验证服务审批（验签 Cart Mandate + 预算核销，启动与支付路径均必填，不可跳过）。
+ *    c. KYC/KYT 合规检查，不满足则拒绝支付。
  * 5) 支付完成后，异步写入交易记录到 Dashboard。
  *
  * 核心链路（简化）：
  * Agent -> gateway.call_service_tool -> downstream tool
- *      -> (如遇支付挑战) onPaymentRequested -> KYC/KYT -> allow/deny
+ *      -> (如遇支付挑战) onPaymentRequested
+ *           -> AP2 runIntentMandateCheck (意图凭证：限额 + 预算)
+ *           -> AP2 runAssuranceCheck     (验签 Cart Mandate + 预算核销)
+ *           -> KYC/KYT runComplianceChecks
+ *           -> allow/deny
  *      -> (支付完成后) recordTransaction -> Dashboard
  */
 import { config } from "dotenv";
@@ -32,6 +39,19 @@ import {
   type ComplianceDecision,
   type PayeeComplianceDecision,
 } from "./compliance.js";
+
+import {
+  extractCartMandate,
+  runAssuranceCheck,
+  type AssuranceConfig,
+  type AssuranceDecision,
+} from "./assurance.js";
+
+import {
+  runIntentMandateCheck,
+  type IntentMandateConfig,
+  type IntentMandateDecision,
+} from "./mandate.js";
 
 import {
   extractPaymentResponseData,
@@ -81,7 +101,9 @@ interface GatewayEnvelope<TDetail = JsonObject> {
   | "service_selected"
   | "tool_execution"
   | "payment_requested"
-  | "compliance_check";
+  | "intent_mandate_check"  // 意图凭证验证阶段（单笔限额 + 剩余预算）
+  | "assurance_check"       // AP2 验证服务审批阶段（验签 + 预算核销）
+  | "compliance_check";     // KYC/KYT 合规检查阶段
   code: string;
   message: string;
   traceId: string;
@@ -94,6 +116,13 @@ interface GatewayEnvelope<TDetail = JsonObject> {
 // =====================================================================
 
 const evmPrivateKey = requireHexPrivateKey("EVM_PRIVATE_KEY");
+
+/**
+ * 网关自身的 EVM 钱包地址，由 EVM_PRIVATE_KEY 推导。
+ * 作为意图凭证验证（POST /api/mandates/intent/vc）的 payerAddress 入参，
+ * 即买方控制台中登记意图授权时使用的地址。
+ */
+const payerAddress = privateKeyToAccount(evmPrivateKey).address;
 
 /** 合规服务配置（KYC/KYT 接口共用） */
 const complianceConfig: ComplianceConfig | null = (() => {
@@ -111,13 +140,56 @@ const complianceConfig: ComplianceConfig | null = (() => {
   };
 })();
 
+/**
+ * AP2 验证服务配置（必填）。
+ *
+ * ASSURANCE_BASE_URL：验证服务根地址。
+ * API Key 与合规服务复用同一个 COMPLIANCE_API_KEY。
+ * AGENTRY_ID：买方控制台下发的意图凭证 ID（见下方非空校验）。
+ *
+ * 缺失任一项时进程直接退出，避免在未审批场景下代付。
+ */
+const assuranceConfig: AssuranceConfig = (() => {
+  const baseUrl = process.env.ASSURANCE_BASE_URL?.trim();
+  const apiKey = process.env.COMPLIANCE_API_KEY?.trim();
+  if (!baseUrl || !apiKey) {
+    console.error("❌ AP2 审批为必填：请配置 ASSURANCE_BASE_URL 与 COMPLIANCE_API_KEY，网关无法启动");
+    process.exit(1);
+  }
+  return { baseUrl, apiKey };
+})();
+
+/** 买方意图凭证 ID，来自 Payer Dashboard，用于 AP2 预算查账（必填，非空） */
+const agentryId = (() => {
+  const id = (process.env.AGENTRY_ID ?? "").trim();
+  if (!id) {
+    console.error("❌ AP2 审批为必填：请配置非空环境变量 AGENTRY_ID，网关无法启动");
+    process.exit(1);
+  }
+  return id;
+})();
+
+/**
+ * 意图凭证验证服务配置。
+ *
+ * 复用现有合规服务的 COMPLIANCE_BASE_URL 和 COMPLIANCE_API_KEY，无需新增环境变量。
+ * 若合规配置缺失，意图凭证验证也将被跳过（与合规检查共同依赖同一配置）。
+ */
+const intentMandateConfig: IntentMandateConfig | null = complianceConfig
+  ? { baseUrl: complianceConfig.baseUrl, apiKey: complianceConfig.apiKey }
+  : null;
+
 /** 交易记录服务配置（与合规服务共享域名和 API Key） */
 const transactionConfig: TransactionConfig | null = complianceConfig
   ? { baseUrl: complianceConfig.baseUrl, apiKey: complianceConfig.apiKey, defaultChain: complianceConfig.chain }
   : null;
 
+/** 缓存每个 service 最近一次意图凭证验证结果，供响应回传 */
+const latestIntentMandateDecisionByService = new Map<string, IntentMandateDecision>();
 /** 缓存每个 service 最近一次合规结果，供响应回传 */
 const latestComplianceDecisionByService = new Map<string, ComplianceDecision>();
+/** 缓存每个 service 最近一次 AP2 审批结果，供响应回传 */
+const latestAssuranceDecisionByService = new Map<string, AssuranceDecision>();
 /** 缓存每个 service 最近一次支付上下文，供响应透传资金流向 */
 const latestPaymentContextByService = new Map<string, PaymentContext>();
 
@@ -208,6 +280,16 @@ function getLatestComplianceDecision(serviceId: string, toolName: string): Compl
   const decision = latestComplianceDecisionByService.get(serviceId);
   if (!decision || decision.toolName !== toolName) return undefined;
   return decision;
+}
+
+/** 获取指定 service 的最近一次 AP2 审批决策 */
+function getLatestAssuranceDecision(serviceId: string): AssuranceDecision | undefined {
+  return latestAssuranceDecisionByService.get(serviceId);
+}
+
+/** 获取指定 service 的最近一次意图凭证验证结果 */
+function getLatestIntentMandateDecision(serviceId: string): IntentMandateDecision | undefined {
+  return latestIntentMandateDecisionByService.get(serviceId);
 }
 
 // =====================================================================
@@ -306,7 +388,9 @@ async function createAndConnectDownstreamClient(
           payTo?: unknown;
           amount: string;
           network: string;
-          extra?: { name?: string };
+          // extra 为 x402 协议的扩展字段，AP2 Cart Mandate 通过此字段传递：
+          // accepts[0].extra.cartMandate = { merchant_id, merchant_address, ... }
+          extra?: Record<string, unknown>;
         }>;
       };
     }) => {
@@ -320,6 +404,62 @@ async function createAndConnectDownstreamClient(
         return false;
       }
 
+      // ── Step 0: 意图凭证验证（AP2 Intent Mandate）──────────────────────
+      // 最先执行，fail-close：配置缺失或验证不通过均拒绝支付，不进入后续流程。
+      // 检查：单笔金额 <= perTxLimit 且 单笔金额 <= remainingBudget。
+      if (!intentMandateConfig) {
+        console.error(`🚫 支付拒绝：服务=${serviceId}，工具=${context.toolName}，原因=意图凭证配置缺失（COMPLIANCE_BASE_URL 或 COMPLIANCE_API_KEY 未配置）`);
+        latestIntentMandateDecisionByService.set(serviceId, {
+          passed: false,
+          reasonCode: "MANDATE_CONFIG_MISSING",
+          message: "Intent mandate configuration is missing.",
+          checkedAt: new Date().toISOString(),
+        });
+        return false;
+      }
+
+      const intentDecision = await runIntentMandateCheck(intentMandateConfig, payerAddress, accepted.amount);
+      latestIntentMandateDecisionByService.set(serviceId, intentDecision);
+
+      if (!intentDecision.passed) {
+        console.error(
+          `🚫 意图凭证验证拒绝（中止支付）：服务=${serviceId}，工具=${context.toolName}，原因码=${intentDecision.reasonCode ?? "UNKNOWN"}，详情=${intentDecision.message ?? ""}`,
+        );
+        return false;
+      }
+
+      // ── Step 1: AP2 验证服务审批（Cart Mandate）────────────────────────
+      // 在 KYC/KYT 合规检查之前，必须完成验证服务审批（启动时已保证配置存在）。
+      // 验证服务完成：① 商户签名 ecrecover 验签；② 预算查账与行级锁核销。
+      // 下游未在支付挑战中携带合法 Cart Mandate 时直接拒绝，不再放行。
+      const cartMandate = extractCartMandate(context.paymentRequired);
+
+      if (!cartMandate) {
+        const checkedAt = new Date().toISOString();
+        latestAssuranceDecisionByService.set(serviceId, {
+          passed: false,
+          status: "ERROR",
+          errorCode: "CART_MANDATE_MISSING",
+          errorMessage: "Cart Mandate is missing or invalid in payment challenge.",
+          checkedAt,
+        });
+        console.error(
+          `🚫 AP2 审批拒绝（中止支付）：服务=${serviceId}，工具=${context.toolName}，原因=Cart Mandate 未找到或格式非法`,
+        );
+        return false;
+      }
+
+      const assuranceDecision = await runAssuranceCheck(assuranceConfig, agentryId, cartMandate);
+      latestAssuranceDecisionByService.set(serviceId, assuranceDecision);
+
+      if (!assuranceDecision.passed) {
+        console.error(
+          `🚫 AP2 审批拒绝（中止支付）：服务=${serviceId}，工具=${context.toolName}，错误码=${assuranceDecision.errorCode ?? "UNKNOWN"}`,
+        );
+        return false;
+      }
+
+      // ── Step 2: KYC/KYT 合规检查（保留现有逻辑）───────────────────────
       // 合规配置缺失时直接拒绝（fail-close）
       if (!complianceConfig) {
         console.error(`🚫 支付拒绝：服务=${serviceId}，工具=${context.toolName}，原因=合规配置缺失`);
@@ -341,12 +481,12 @@ async function createAndConnectDownstreamClient(
         return false;
       }
 
-      // 缓存支付上下文，供响应透传和交易记录写入
+      // ── Step 3: 放行，缓存支付上下文供后续响应和交易记录使用 ────────────
       latestPaymentContextByService.set(serviceId, {
         amount: accepted.amount,
         payTo: counterparty,
         network: accepted.network,
-        tokenSymbol: accepted.extra?.name ?? "UNKNOWN",
+        tokenSymbol: (accepted.extra?.["name"] as string | undefined) ?? "UNKNOWN",
       });
 
       console.error(
@@ -444,6 +584,8 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
       try {
         const result = await service.client.callTool(args.toolName, args.args ?? {});
         const latestCompliance = getLatestComplianceDecision(service.serviceId, args.toolName);
+        const latestAssurance = getLatestAssuranceDecision(service.serviceId);
+        const latestIntentMandate = getLatestIntentMandateDecision(service.serviceId);
         const latestPaymentCtx = latestPaymentContextByService.get(service.serviceId) ?? null;
         const payeeCompliance = extractPayeeCompliance(result.content);
         const paymentResponseData = extractPaymentResponseData(result.paymentResponse);
@@ -465,6 +607,8 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
           toolName: string;
           paymentMade: boolean;
           paymentResponse: unknown;
+          intentMandateDecision: IntentMandateDecision | null;
+          assuranceDecision: AssuranceDecision | null;
           complianceDecision: ComplianceDecision | null;
           payeeComplianceDecision: PayeeComplianceDecision | null;
           paymentContext: PaymentContext | null;
@@ -481,6 +625,8 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
             toolName: args.toolName,
             paymentMade: result.paymentMade ?? false,
             paymentResponse: result.paymentResponse ?? null,
+            intentMandateDecision: latestIntentMandate ?? null,
+            assuranceDecision: latestAssurance ?? null,
             complianceDecision: latestCompliance ?? null,
             payeeComplianceDecision: payeeCompliance,
             paymentContext: (result.paymentMade ?? false) ? latestPaymentCtx : null,
@@ -491,6 +637,8 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
         return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
       } catch (error) {
         const latestCompliance = getLatestComplianceDecision(service.serviceId, args.toolName);
+        const latestAssurance = getLatestAssuranceDecision(service.serviceId);
+        const latestIntentMandate = getLatestIntentMandateDecision(service.serviceId);
         const latestPaymentCtx = latestPaymentContextByService.get(service.serviceId) ?? null;
         const errorMessage = error instanceof Error ? error.message : String(error);
 
@@ -507,23 +655,53 @@ function registerGatewayTools(mcpServer: McpServer, registry: DownstreamServiceR
           }));
         }
 
+        // 确定失败阶段：意图凭证拒绝 > AP2 审批拒绝 > 合规拒绝 > 工具执行失败
+        const isIntentMandateRejected = latestIntentMandate && !latestIntentMandate.passed;
+        const isAssuranceRejected = latestAssurance && !latestAssurance.passed;
+        const isComplianceRejected = latestCompliance && !latestCompliance.passed;
+        const failStage = isIntentMandateRejected
+          ? "intent_mandate_check" as const
+          : isAssuranceRejected
+            ? "assurance_check" as const
+            : isComplianceRejected
+              ? "compliance_check" as const
+              : "tool_execution" as const;
+        const failCode = isIntentMandateRejected
+          ? (latestIntentMandate.reasonCode ?? "INTENT_MANDATE_REJECTED")
+          : isAssuranceRejected
+            ? (latestAssurance.errorCode ?? "ASSURANCE_REJECTED")
+            : isComplianceRejected
+              ? latestCompliance.reasonCode
+              : "TOOL_CALL_FAILED";
+        const failMessage = isIntentMandateRejected
+          ? (latestIntentMandate.message ?? "Intent mandate check rejected the payment.")
+          : isAssuranceRejected
+            ? (latestAssurance.errorMessage ?? "AP2 assurance check rejected the payment.")
+            : isComplianceRejected
+              ? latestCompliance.message
+              : "Downstream tool call failed.";
+
         const response: GatewayEnvelope<{
           serviceId: string;
           toolName: string;
+          intentMandateDecision: IntentMandateDecision | null;
+          assuranceDecision: AssuranceDecision | null;
           complianceDecision: ComplianceDecision | null;
           payeeComplianceDecision: PayeeComplianceDecision | null;
           paymentContext: PaymentContext | null;
           downstreamError: string;
         }> = {
           ok: false,
-          stage: latestCompliance && !latestCompliance.passed ? "compliance_check" : "tool_execution",
-          code: latestCompliance && !latestCompliance.passed ? latestCompliance.reasonCode : "TOOL_CALL_FAILED",
-          message: latestCompliance && !latestCompliance.passed ? latestCompliance.message : "Downstream tool call failed.",
+          stage: failStage,
+          code: failCode,
+          message: failMessage,
           traceId,
           timestamp: new Date().toISOString(),
           detail: {
             serviceId: service.serviceId,
             toolName: args.toolName,
+            intentMandateDecision: latestIntentMandate ?? null,
+            assuranceDecision: latestAssurance ?? null,
             complianceDecision: latestCompliance ?? null,
             payeeComplianceDecision: null,
             paymentContext: latestPaymentCtx,

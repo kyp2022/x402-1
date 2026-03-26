@@ -124,21 +124,24 @@ pnpm dev
 
 如果你希望别人不依赖你的本地仓库路径，推荐发布为 npm CLI 包。
 
-1. 在本目录执行打包自检：
+1. 在本目录一键打包（生成 `release/*.tgz`）：
 
 ```bash
-cd /Users/ppg/Desktop/agentry/x402/examples/typescript/servers/mcp-gateway
-pnpm install --no-frozen-lockfile
-pnpm lint:check
-pnpm exec tsc --noEmit
-pnpm pack
+cd examples/typescript/mcp-gateway
+pnpm run pack:release
+# 或：./scripts/pack-for-publish.sh
+# 已安装依赖时可加速：SKIP_INSTALL=1 pnpm run pack:release
 ```
 
-2. 验证无误后发布：
+可选：发布前再跑 `pnpm run lint:check`。
+
+2. 验证无误后发布（作用域包需公开访问）：
 
 ```bash
-npm publish
+npm publish release/你的包名-版本.tgz --access public
 ```
+
+（具体文件名以脚本结尾打印为准。）
 
 > 建议发布前把 `package.json` 中的 `name` 改成你自己的 npm scope（例如 `@your-scope/x402-mcp-gateway`），避免包名冲突。
 
